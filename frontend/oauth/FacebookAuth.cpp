@@ -1,6 +1,5 @@
 #include "FacebookAuth.hpp"
 
-#include <oauth/AuthListener.hpp>
 #include <utility/obf.h>
 #include <utility/RemoteTextThread.hpp>
 #include <widgets/OBSBasic.hpp>
@@ -8,8 +7,15 @@
 #include <qt-wrappers.hpp>
 #include <ui-config.h>
 
+#include <QApplication>
+#include <QClipboard>
 #include <QDesktopServices>
-#include <QRandomGenerator>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QUrl>
+#include <QVBoxLayout>
 
 #include <json11.hpp>
 
@@ -17,26 +23,203 @@
 
 using namespace json11;
 
-#define FACEBOOK_AUTH_URL "https://www.facebook.com/v19.0/dialog/oauth"
-#define FACEBOOK_TOKEN_URL "https://graph.facebook.com/v19.0/oauth/access_token"
-#define FACEBOOK_SCOPE_VERSION 1
-#define FACEBOOK_API_STATE_LENGTH 32
-#define SECTION_NAME "Facebook"
+/* Facebook Graph API v19.0 Device Login endpoints */
+#define FACEBOOK_DEVICE_LOGIN_URL \
+	"https://graph.facebook.com/v19.0/device/login"
+#define FACEBOOK_DEVICE_LOGIN_STATUS_URL \
+	"https://graph.facebook.com/v19.0/device/login_status"
+#define FACEBOOK_TOKEN_URL \
+	"https://graph.facebook.com/v19.0/oauth/access_token"
 
-static const char allowedChars[] =
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-static const int allowedCount = static_cast<int>(sizeof(allowedChars) - 1);
+#define FACEBOOK_SCOPE_VERSION 1
+#define SECTION_NAME "Facebook"
 
 static Auth::Def facebookDef = {"Facebook Live",
 				Auth::Type::OAuth_StreamKey, true, false};
 
-/* ------------------------------------------------------------------------- */
+/* ========================================================================= */
+/* FacebookDeviceDialog                                                      */
+/* ========================================================================= */
 
-static inline void OpenBrowser(const QString auth_uri)
+FacebookDeviceDialog::FacebookDeviceDialog(QWidget *parent,
+					   const std::string &userCode,
+					   const std::string &verificationUri,
+					   const std::string &deviceCode_,
+					   const std::string &appToken_,
+					   int interval, int expiresIn)
+	: QDialog(parent),
+	  deviceCode(deviceCode_),
+	  appToken(appToken_),
+	  pollInterval(interval > 0 ? interval : 5),
+	  expirySeconds(expiresIn)
 {
-	QUrl url(auth_uri, QUrl::StrictMode);
-	QDesktopServices::openUrl(url);
+	setWindowTitle(QTStr("Facebook.Auth.DeviceLogin.Title"));
+	setMinimumWidth(420);
+	setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
+
+	auto *layout = new QVBoxLayout(this);
+	layout->setSpacing(12);
+
+	/* Instruction text */
+	instructionLabel = new QLabel(this);
+	instructionLabel->setWordWrap(true);
+	instructionLabel->setTextFormat(Qt::RichText);
+	instructionLabel->setOpenExternalLinks(true);
+
+	QString uri = QString::fromStdString(verificationUri);
+	instructionLabel->setText(
+		QTStr("Facebook.Auth.DeviceLogin.Instruction")
+			.arg(QString("<a href='%1'>%1</a>").arg(uri)));
+	layout->addWidget(instructionLabel);
+
+	/* User code — displayed large and prominent */
+	codeLabel = new QLabel(QString::fromStdString(userCode), this);
+	QFont codeFont = codeLabel->font();
+	codeFont.setPointSize(28);
+	codeFont.setBold(true);
+	codeFont.setLetterSpacing(QFont::AbsoluteSpacing, 4);
+	codeLabel->setFont(codeFont);
+	codeLabel->setAlignment(Qt::AlignCenter);
+	codeLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	codeLabel->setStyleSheet(
+		"QLabel { background: palette(base); border: 1px solid "
+		"palette(mid); border-radius: 6px; padding: 16px; }");
+	layout->addWidget(codeLabel);
+
+	/* Copy button */
+	auto *buttonRow = new QHBoxLayout();
+	copyButton = new QPushButton(
+		QTStr("Facebook.Auth.DeviceLogin.CopyCode"), this);
+	connect(copyButton, &QPushButton::clicked, this, [userCode]() {
+		QApplication::clipboard()->setText(
+			QString::fromStdString(userCode));
+	});
+	buttonRow->addStretch();
+	buttonRow->addWidget(copyButton);
+	buttonRow->addStretch();
+	layout->addLayout(buttonRow);
+
+	/* Expiry progress bar */
+	expiryBar = new QProgressBar(this);
+	expiryBar->setRange(0, expirySeconds);
+	expiryBar->setValue(expirySeconds);
+	expiryBar->setTextVisible(false);
+	expiryBar->setFixedHeight(6);
+	layout->addWidget(expiryBar);
+
+	/* Status label */
+	auto *statusLabel = new QLabel(
+		QTStr("Facebook.Auth.DeviceLogin.Waiting"), this);
+	statusLabel->setAlignment(Qt::AlignCenter);
+	layout->addWidget(statusLabel);
+
+	/* Cancel button */
+	cancelButton = new QPushButton(QTStr("Cancel"), this);
+	connect(cancelButton, &QPushButton::clicked, this, &QDialog::reject);
+	auto *cancelRow = new QHBoxLayout();
+	cancelRow->addStretch();
+	cancelRow->addWidget(cancelButton);
+	layout->addLayout(cancelRow);
+
+	setLayout(layout);
+
+	/* Start polling timer */
+	connect(&pollTimer, &QTimer::timeout, this,
+		&FacebookDeviceDialog::PollForToken);
+	pollTimer.start(pollInterval * 1000);
+
+	/* Start expiry countdown timer */
+	connect(&expiryTimer, &QTimer::timeout, this,
+		&FacebookDeviceDialog::OnExpiryTick);
+	expiryTimer.start(1000);
 }
+
+FacebookDeviceDialog::~FacebookDeviceDialog()
+{
+	pollTimer.stop();
+	expiryTimer.stop();
+}
+
+void FacebookDeviceDialog::PollForToken()
+{
+	std::string post_data;
+	post_data += "access_token=";
+	post_data += appToken;
+	post_data += "&code=";
+	post_data += deviceCode;
+
+	std::string output;
+	std::string error;
+
+	bool success = GetRemoteFile(
+		FACEBOOK_DEVICE_LOGIN_STATUS_URL, output, error, nullptr,
+		"application/x-www-form-urlencoded", "", post_data.c_str(),
+		std::vector<std::string>(), nullptr, 5);
+
+	if (!success || output.empty())
+		return;
+
+	std::string parse_error;
+	Json json = Json::parse(output, parse_error);
+	if (!parse_error.empty())
+		return;
+
+	/* Check for pending/errors */
+	auto errObj = json["error"];
+	if (errObj.is_object()) {
+		int subcode = errObj["error_subcode"].int_value();
+		/* 1349174 = authorization_pending — keep polling */
+		if (subcode == 1349174)
+			return;
+		/* 1349172 = code_expired */
+		if (subcode == 1349172) {
+			reject();
+			return;
+		}
+		/* 1349152 = slow_down — increase interval */
+		if (subcode == 1349152) {
+			pollInterval += 2;
+			pollTimer.setInterval(pollInterval * 1000);
+			return;
+		}
+		/* Any other error — abort */
+		blog(LOG_WARNING,
+		     "FacebookDeviceDialog: poll error: %s (subcode %d)",
+		     errObj["message"].string_value().c_str(), subcode);
+		reject();
+		return;
+	}
+
+	/* Success — we have an access token */
+	resultToken = json["access_token"].string_value();
+	int expiresIn = json["expires_in"].int_value();
+	if (expiresIn > 0)
+		resultExpireTime = (uint64_t)time(nullptr) + expiresIn;
+
+	if (!resultToken.empty()) {
+		pollTimer.stop();
+		expiryTimer.stop();
+		emit TokenReceived();
+		accept();
+	}
+}
+
+void FacebookDeviceDialog::OnExpiryTick()
+{
+	elapsedSeconds++;
+	int remaining = expirySeconds - elapsedSeconds;
+	if (remaining <= 0) {
+		expiryTimer.stop();
+		pollTimer.stop();
+		reject();
+		return;
+	}
+	expiryBar->setValue(remaining);
+}
+
+/* ========================================================================= */
+/* FacebookAuth                                                              */
+/* ========================================================================= */
 
 static void DeleteCookies()
 {
@@ -49,15 +232,27 @@ static void DeleteCookies()
 
 void RegisterFacebookAuth()
 {
+#if !defined(__APPLE__) && !defined(_WIN32)
+	if (QApplication::platformName().contains("wayland"))
+		return;
+#endif
+
 	OAuth::RegisterOAuth(
 		facebookDef,
 		[]() { return std::make_shared<FacebookAuth>(facebookDef); },
 		FacebookAuth::Login, DeleteCookies);
 }
 
-FacebookAuth::FacebookAuth(const Def &d) : OAuthStreamKey(d) {}
+FacebookAuth::FacebookAuth(const Def &d) : OAuthStreamKey(d)
+{
+	connect(&refreshTimer, &QTimer::timeout, this,
+		&FacebookAuth::ScheduleTokenRefresh);
+}
 
-FacebookAuth::~FacebookAuth() {}
+FacebookAuth::~FacebookAuth()
+{
+	refreshTimer.stop();
+}
 
 bool FacebookAuth::RetryLogin()
 {
@@ -91,6 +286,10 @@ bool FacebookAuth::LoadInternal()
 	currentScopeVer =
 		(int)config_get_int(main->Config(), SECTION_NAME, "ScopeVer");
 	firstLoad = false;
+
+	if (!token.empty())
+		ScheduleTokenRefresh();
+
 	return !token.empty();
 }
 
@@ -101,22 +300,45 @@ void FacebookAuth::LoadUI()
 	uiLoaded = true;
 }
 
-QString FacebookAuth::GenerateState()
+void FacebookAuth::ScheduleTokenRefresh()
 {
-	char state[FACEBOOK_API_STATE_LENGTH + 1];
-	QRandomGenerator *rng = QRandomGenerator::system();
-	int i;
+	if (expire_time == 0)
+		return;
 
-	for (i = 0; i < FACEBOOK_API_STATE_LENGTH; i++)
-		state[i] = allowedChars[rng->bounded(0, allowedCount)];
-	state[i] = 0;
+	uint64_t now = (uint64_t)time(nullptr);
+	if (now >= expire_time) {
+		blog(LOG_WARNING,
+		     "FacebookAuth: Token already expired, "
+		     "user must re-authenticate");
+		return;
+	}
 
-	return state;
+	/* Refresh 24 hours before expiry, or halfway if less than 48h left */
+	uint64_t remaining = expire_time - now;
+	uint64_t refreshIn;
+	if (remaining > 48 * 3600)
+		refreshIn = remaining - 24 * 3600;
+	else
+		refreshIn = remaining / 2;
+
+	refreshTimer.setSingleShot(true);
+	refreshTimer.start((int)(refreshIn * 1000));
+
+	blog(LOG_INFO,
+	     "FacebookAuth: Token refresh scheduled in %llu seconds",
+	     (unsigned long long)refreshIn);
 }
 
-bool FacebookAuth::ExchangeForLongLivedToken(const std::string &client_id,
-					      const std::string &secret)
+bool FacebookAuth::ExchangeForLongLivedToken(const std::string &appToken)
 {
+	/* Extract client_id and secret from the app token (format: id|secret) */
+	size_t pipe = appToken.find('|');
+	if (pipe == std::string::npos)
+		return false;
+
+	std::string client_id = appToken.substr(0, pipe);
+	std::string secret = appToken.substr(pipe + 1);
+
 	std::string url = FACEBOOK_TOKEN_URL;
 	std::string post_data;
 	post_data += "grant_type=fb_exchange_token";
@@ -186,84 +408,85 @@ bool FacebookAuth::ExchangeForLongLivedToken(const std::string &client_id,
 	return true;
 }
 
-// Static.
+/* static */
 std::shared_ptr<Auth> FacebookAuth::Login(QWidget *owner,
 					   const std::string &service)
 {
-	QString auth_code;
-	AuthListener server;
-
 	if (service != facebookDef.service)
 		return nullptr;
 
 	auto auth = std::make_shared<FacebookAuth>(facebookDef);
 
-	QString redirect_uri =
-		QString("http://127.0.0.1:%1").arg(server.GetPort());
-
-	QMessageBox dlg(owner);
-	dlg.setWindowFlags(dlg.windowFlags() & ~Qt::WindowCloseButtonHint);
-	dlg.setWindowTitle(QTStr("Facebook.Auth.WaitingAuth.Title"));
-
+	/* Build the app access token: APP_ID|APP_SECRET */
 	std::string clientid = FACEBOOK_CLIENTID;
 	std::string secret = FACEBOOK_SECRET;
 	deobfuscate_str(&clientid[0], FACEBOOK_CLIENTID_HASH);
 	deobfuscate_str(&secret[0], FACEBOOK_SECRET_HASH);
 
-	QString state;
-	state = auth->GenerateState();
-	server.SetState(state);
+	std::string appToken = clientid + "|" + secret;
 
-	QString url_template;
-	url_template += "%1";
-	url_template += "?response_type=code";
-	url_template += "&client_id=%2";
-	url_template += "&redirect_uri=%3";
-	url_template += "&state=%4";
-	url_template += "&scope=publish_video";
-	QString url = url_template.arg(FACEBOOK_AUTH_URL, clientid.c_str(),
-				       redirect_uri, state);
+	/* Step 1: Request a device code from Facebook */
+	std::string post_data;
+	post_data += "access_token=";
+	post_data += appToken;
+	post_data += "&scope=publish_video";
 
-	QString text = QTStr("Facebook.Auth.WaitingAuth.Text");
-	text = text.arg(
-		QString("<a href='%1'>Facebook OAuth Service</a>").arg(url));
+	std::string output;
+	std::string error;
+	bool success = false;
 
-	dlg.setText(text);
-	dlg.setTextFormat(Qt::RichText);
-	dlg.setStandardButtons(QMessageBox::StandardButton::Cancel);
-#if defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
-	dlg.setOption(QMessageBox::Option::DontUseNativeDialog);
-#endif
+	auto func = [&]() {
+		success = GetRemoteFile(
+			FACEBOOK_DEVICE_LOGIN_URL, output, error, nullptr,
+			"application/x-www-form-urlencoded", "",
+			post_data.c_str(), std::vector<std::string>(), nullptr,
+			5);
+	};
 
-	connect(&dlg, &QMessageBox::buttonClicked, &dlg,
-		[&](QAbstractButton *) {
-#ifdef _DEBUG
-			blog(LOG_DEBUG, "Action Cancelled.");
-#endif
-			dlg.reject();
-		});
+	ExecThreadedWithoutBlocking(func, QTStr("Auth.Authing.Title"),
+				    QTStr("Facebook.Auth.DeviceLogin.Init"));
 
-	// Async Login.
-	connect(&server, &AuthListener::ok, &dlg,
-		[&dlg, &auth_code](QString code) {
-#ifdef _DEBUG
-			blog(LOG_DEBUG,
-			     "Got facebook redirected answer: %s",
-			     QT_TO_UTF8(code));
-#endif
-			auth_code = code;
-			dlg.accept();
-		});
-	connect(&server, &AuthListener::fail, &dlg, [&dlg]() {
-#ifdef _DEBUG
-		blog(LOG_DEBUG, "No access granted");
-#endif
-		dlg.reject();
-	});
+	if (!success || output.empty()) {
+		blog(LOG_WARNING,
+		     "FacebookAuth::Login: Failed to request device code: %s",
+		     error.c_str());
+		return nullptr;
+	}
 
-	auto open_external_browser = [url]() { OpenBrowser(url); };
-	QScopedPointer<QThread> thread(CreateQThread(open_external_browser));
-	thread->start();
+	std::string parse_error;
+	Json json = Json::parse(output, parse_error);
+	if (!parse_error.empty()) {
+		blog(LOG_WARNING,
+		     "FacebookAuth::Login: Failed to parse device code "
+		     "response: %s",
+		     parse_error.c_str());
+		return nullptr;
+	}
+
+	std::string err = json["error"]["message"].string_value();
+	if (!err.empty()) {
+		blog(LOG_WARNING, "FacebookAuth::Login: API error: %s",
+		     err.c_str());
+		return nullptr;
+	}
+
+	std::string userCode = json["user_code"].string_value();
+	std::string deviceCode = json["code"].string_value();
+	std::string verificationUri =
+		json["verification_uri"].string_value();
+	int interval = json["interval"].int_value();
+	int expiresIn = json["expires_in"].int_value();
+
+	if (userCode.empty() || deviceCode.empty()) {
+		blog(LOG_WARNING,
+		     "FacebookAuth::Login: Missing user_code or device code "
+		     "in response");
+		return nullptr;
+	}
+
+	/* Step 2: Show the Device Dialog and poll for authorization */
+	FacebookDeviceDialog dlg(owner, userCode, verificationUri, deviceCode,
+				 appToken, interval, expiresIn);
 
 #if defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 5, 0) && \
 	QT_VERSION < QT_VERSION_CHECK(6, 6, 0)
@@ -276,22 +499,23 @@ std::shared_ptr<Auth> FacebookAuth::Login(QWidget *owner,
 	dlg.exec();
 #endif
 
-	if (dlg.result() == QMessageBox::Cancel ||
-	    dlg.result() == QDialog::Rejected)
+	if (dlg.result() != QDialog::Accepted || dlg.resultToken.empty())
 		return nullptr;
 
-	if (!auth->GetToken(FACEBOOK_TOKEN_URL, clientid, secret,
-			    QT_TO_UTF8(redirect_uri), FACEBOOK_SCOPE_VERSION,
-			    QT_TO_UTF8(auth_code), true)) {
-		return nullptr;
-	}
+	/* Step 3: Store the short-lived token */
+	auth->token = dlg.resultToken;
+	auth->expire_time = dlg.resultExpireTime;
+	auth->currentScopeVer = FACEBOOK_SCOPE_VERSION;
 
-	/* Exchange short-lived token for long-lived token (60 days) */
-	if (!auth->ExchangeForLongLivedToken(clientid, secret)) {
+	/* Step 4: Exchange for long-lived token (60 days) */
+	if (!auth->ExchangeForLongLivedToken(appToken)) {
 		blog(LOG_WARNING,
 		     "FacebookAuth: Failed to exchange for long-lived token, "
 		     "continuing with short-lived token");
 	}
+
+	/* Step 5: Schedule proactive refresh */
+	auth->ScheduleTokenRefresh();
 
 	config_t *config = OBSBasic::Get()->Config();
 	config_save_safe(config, "tmp", nullptr);
