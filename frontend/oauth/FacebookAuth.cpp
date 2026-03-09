@@ -15,6 +15,7 @@
 #include <QDesktopServices>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QUrl>
@@ -450,9 +451,18 @@ std::shared_ptr<Auth> FacebookAuth::Login(QWidget *owner,
 				    QTStr("Facebook.Auth.DeviceLogin.Init"));
 
 	if (!success || output.empty()) {
+		QString errMsg =
+			QString("Failed to request device code from Facebook.\n\n"
+				"Error: %1\n\n"
+				"Make sure 'Login from Devices' is enabled in your "
+				"Facebook app settings under Facebook Login > Settings.")
+				.arg(error.c_str());
 		blog(LOG_WARNING,
 		     "FacebookAuth::Login: Failed to request device code: %s",
 		     error.c_str());
+		QMessageBox::warning(owner,
+				     QTStr("Facebook.Auth.Error.Title"),
+				     errMsg);
 		return nullptr;
 	}
 
@@ -463,13 +473,26 @@ std::shared_ptr<Auth> FacebookAuth::Login(QWidget *owner,
 		     "FacebookAuth::Login: Failed to parse device code "
 		     "response: %s",
 		     parse_error.c_str());
+		QMessageBox::warning(
+			owner, QTStr("Facebook.Auth.Error.Title"),
+			QString("Failed to parse Facebook response.\n\n"
+				"Error: %1")
+				.arg(parse_error.c_str()));
 		return nullptr;
 	}
 
 	std::string err = json["error"]["message"].string_value();
 	if (!err.empty()) {
-		blog(LOG_WARNING, "FacebookAuth::Login: API error: %s",
-		     err.c_str());
+		int errCode = json["error"]["code"].int_value();
+		blog(LOG_WARNING,
+		     "FacebookAuth::Login: API error (code %d): %s",
+		     errCode, err.c_str());
+		QMessageBox::warning(
+			owner, QTStr("Facebook.Auth.Error.Title"),
+			QString("Facebook API error:\n\n%1\n\n"
+				"Error code: %2")
+				.arg(err.c_str())
+				.arg(errCode));
 		return nullptr;
 	}
 
@@ -484,6 +507,11 @@ std::shared_ptr<Auth> FacebookAuth::Login(QWidget *owner,
 		blog(LOG_WARNING,
 		     "FacebookAuth::Login: Missing user_code or device code "
 		     "in response");
+		QMessageBox::warning(
+			owner, QTStr("Facebook.Auth.Error.Title"),
+			QString("Facebook did not return a device code.\n\n"
+				"Make sure 'Login from Devices' is enabled "
+				"in your Facebook app settings."));
 		return nullptr;
 	}
 
