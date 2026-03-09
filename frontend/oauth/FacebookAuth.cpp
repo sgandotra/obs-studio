@@ -4,6 +4,9 @@
 #include <utility/RemoteTextThread.hpp>
 #include <widgets/OBSBasic.hpp>
 
+#ifdef BROWSER_AVAILABLE
+#include <browser-panel.hpp>
+#endif
 #include <qt-wrappers.hpp>
 #include <ui-config.h>
 
