@@ -1,3 +1,34 @@
+// FacebookAuth.cpp - Facebook Live OAuth2 integration for OBS Studio.
+//
+// Constants & Registration (lines ~30-60):
+//   Defines Facebook Graph API v19.0 endpoints for OAuth and token exchange.
+//   Service type is OAuth_StreamKey (external OAuth, no broadcast flow).
+//   RegisterFacebookAuth() registers the factory, login callback, and cookie
+//   cleanup into the OBS auth system. DeleteCookies() clears facebook.com
+//   cookies from the embedded CEF browser when the user disconnects.
+//
+// Config Persistence (SaveInternal/LoadInternal):
+//   Writes/reads Token, ExpireTime, and ScopeVer to OBS config under the
+//   [Facebook] section.
+//
+// State Generation (GenerateState):
+//   Creates a 32-char random alphanumeric string for OAuth CSRF protection.
+//
+// Long-Lived Token Exchange (ExchangeForLongLivedToken):
+//   POSTs to the Graph API with grant_type=fb_exchange_token to swap the
+//   short-lived token (~1-2 hours) for a long-lived one (~60 days). Runs
+//   on a background thread with a progress dialog.
+//
+// Login Flow (Login - static):
+//   1. Starts a local AuthListener HTTP server to receive the OAuth redirect.
+//   2. Deobfuscates the compiled-in client ID and secret.
+//   3. Builds the Facebook OAuth URL (response_type=code, scope=publish_video).
+//   4. Opens the user's default browser to the Facebook login page.
+//   5. Shows a modal QMessageBox while waiting for the redirect callback.
+//   6. On success, exchanges the auth code for a short-lived token (GetToken),
+//      then upgrades to a long-lived token (ExchangeForLongLivedToken).
+//   7. Saves config and returns the auth object.
+
 #include "FacebookAuth.hpp"
 
 #include <oauth/AuthListener.hpp>
@@ -12,6 +43,10 @@
 #include <QRandomGenerator>
 
 #include <json11.hpp>
+
+#ifdef BROWSER_AVAILABLE
+#include <browser-panel.hpp>
+#endif
 
 #include "moc_FacebookAuth.cpp"
 

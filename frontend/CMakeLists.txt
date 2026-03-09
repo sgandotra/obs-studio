@@ -1,3 +1,19 @@
+# Frontend CMakeLists.txt - Build definition for the OBS Studio Qt6 GUI application.
+#
+# Setup: Builds the frontend C API (api/), checks ENABLE_FRONTEND option.
+# Dependencies: Finds FFmpeg, CURL, and ensures json11/libobs/bpm targets exist.
+# Target: Creates the obs-studio executable and links core dependencies.
+# Features: Includes modular cmake files for UI components (ui-*.cmake) and
+#   optional features (feature-*.cmake): importers, plugin manager, browser panels,
+#   Twitch, Restream, YouTube, Facebook, What's New, Idian Playground.
+# Config: Builds frontend plugins, generates ui-config.h with feature flags,
+#   adds core sources (obs-main.cpp, OBSApp.cpp, etc.).
+# Platform: Includes platform-specific cmake for Windows/macOS/Linux/FreeBSD.
+# Graphics: Sets DL_* compile definitions for runtime loading of GPU backends
+#   (OpenGL, Metal, D3D11).
+# Modules: Bakes enabled plugin module list into SAFE_MODULES define,
+#   organizes sources into IDE groups.
+
 cmake_minimum_required(VERSION 3.28...3.30)
 
 add_subdirectory(api)

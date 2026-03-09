@@ -1,5 +1,21 @@
 #pragma once
 
+// FacebookAuth - OAuth integration for Facebook Live streaming.
+//
+// Extends OAuthStreamKey to implement the Facebook OAuth2 flow:
+// - Login() launches an external browser for Facebook OAuth, listens for
+//   the redirect via AuthListener, exchanges the auth code for a token,
+//   then upgrades to a long-lived token (60-day expiry).
+// - SaveInternal()/LoadInternal() persist the access token, expiry time,
+//   and scope version to OBS config under the "Facebook" section.
+// - GenerateState() creates a random state string for CSRF protection.
+// - ExchangeForLongLivedToken() swaps a short-lived token for a
+//   long-lived one via the Facebook Graph API.
+// - LoadUI() is a stub for future UI additions (e.g. chat, dashboard).
+//
+// Registered via RegisterFacebookAuth() in FacebookAuth.cpp, which also
+// handles cookie cleanup for facebook.com when the user disconnects.
+
 #include "OAuth.hpp"
 
 class FacebookAuth : public OAuthStreamKey {
